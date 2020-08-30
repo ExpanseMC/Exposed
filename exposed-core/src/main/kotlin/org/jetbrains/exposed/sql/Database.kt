@@ -16,7 +16,7 @@ class Database private constructor(private val resolvedVendor: String? = null, v
 
     var useNestedTransactions: Boolean = false
 
-    internal fun <T> metadata(body: ExposedDatabaseMetadata.() -> T) : T {
+    internal fun <T> metadata(body: ExposedDatabaseMetadata.() -> T): T {
         val transaction = TransactionManager.currentOrNull()
         return if (transaction == null) {
             val connection = connector()
@@ -58,8 +58,10 @@ class Database private constructor(private val resolvedVendor: String? = null, v
     companion object {
         private val dialects = ConcurrentHashMap<String, () -> DatabaseDialect>()
 
-        private val connectionInstanceImpl : DatabaseConnectionAutoRegistration =
-                ServiceLoader.load(DatabaseConnectionAutoRegistration::class.java, Database::class.java.classLoader).firstOrNull() ?: error("Can't load implementation for ${DatabaseConnectionAutoRegistration::class.simpleName}")
+        private val connectionInstanceImpl: DatabaseConnectionAutoRegistration by lazy {
+            ServiceLoader.load(DatabaseConnectionAutoRegistration::class.java, Database::class.java.classLoader).firstOrNull()
+                    ?: error("Can't load implementation for ${DatabaseConnectionAutoRegistration::class.simpleName}")
+        }
 
         init {
             registerDialect(H2Dialect.dialectName) { H2Dialect() }
@@ -72,62 +74,71 @@ class Database private constructor(private val resolvedVendor: String? = null, v
             registerDialect(MariaDBDialect.dialectName) { MariaDBDialect() }
         }
 
-        fun registerDialect(prefix:String, dialect: () -> DatabaseDialect) {
+        fun registerDialect(prefix: String, dialect: () -> DatabaseDialect) {
             dialects[prefix] = dialect
         }
 
         private fun doConnect(
-            explicitVendor: String?,
-            getNewConnection: () -> Connection,
-            setupConnection: (Connection) -> Unit = {},
-            manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
+                explicitVendor: String?,
+                registration: DatabaseConnectionAutoRegistration? = null,
+                getNewConnection: () -> Connection,
+                setupConnection: (Connection) -> Unit = {},
+                manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
         ): Database {
             return Database(explicitVendor) {
-                connectionInstanceImpl(getNewConnection().apply { setupConnection(this) })
+                (registration ?: connectionInstanceImpl)(getNewConnection().apply { setupConnection(this) })
             }.apply {
                 TransactionManager.registerManager(this, manager(this))
             }
         }
 
-        fun connect(datasource: DataSource, setupConnection: (Connection) -> Unit = {},
+        fun connect(datasource: DataSource,
+                    registration: DatabaseConnectionAutoRegistration? = null,
+                    setupConnection: (Connection) -> Unit = {},
                     manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
         ): Database {
-            return doConnect(explicitVendor = null, getNewConnection = { datasource.connection!! }, setupConnection = setupConnection, manager = manager)
+            return doConnect(explicitVendor = null, registration = registration, getNewConnection = { datasource.connection!! }, setupConnection = setupConnection, manager = manager)
         }
 
         @Deprecated(level = DeprecationLevel.ERROR, replaceWith = ReplaceWith("connectPool(datasource, setupConnection, manager)"), message = "Use connectPool instead")
-        fun connect(datasource: ConnectionPoolDataSource, setupConnection: (Connection) -> Unit = {},
+        fun connect(datasource: ConnectionPoolDataSource,
+                    registration: DatabaseConnectionAutoRegistration? = null,
+                    setupConnection: (Connection) -> Unit = {},
                     manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
         ): Database {
-            return doConnect(explicitVendor = null, getNewConnection = { datasource.pooledConnection.connection!! }, setupConnection = setupConnection, manager = manager)
+            return doConnect(explicitVendor = null, registration = registration, getNewConnection = { datasource.pooledConnection.connection!! }, setupConnection = setupConnection, manager = manager)
         }
 
-        fun connectPool(datasource: ConnectionPoolDataSource, setupConnection: (Connection) -> Unit = {},
+        fun connectPool(datasource: ConnectionPoolDataSource,
+                        registration: DatabaseConnectionAutoRegistration? = null,
+                        setupConnection: (Connection) -> Unit = {},
+                        manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
+        ): Database {
+            return doConnect(explicitVendor = null, registration = registration, getNewConnection = { datasource.pooledConnection.connection!! }, setupConnection = setupConnection, manager = manager)
+        }
+
+        fun connect(registration: DatabaseConnectionAutoRegistration? = null,
+                    getNewConnection: () -> Connection,
                     manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
         ): Database {
-            return doConnect(explicitVendor = null, getNewConnection = { datasource.pooledConnection.connection!! }, setupConnection = setupConnection, manager = manager)
+            return doConnect(explicitVendor = null, registration = registration, getNewConnection = getNewConnection, manager = manager)
         }
 
-        fun connect(getNewConnection: () -> Connection,
-                    manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
-        ): Database {
-            return doConnect(explicitVendor = null, getNewConnection = getNewConnection, manager = manager )
-        }
-
-        fun connect(url: String, driver: String=getDriver(url), user: String = "", password: String = "", setupConnection: (Connection) -> Unit = {},
+        fun connect(registration: DatabaseConnectionAutoRegistration? = null,
+                    url: String, driver: String = getDriver(url), user: String = "", password: String = "", setupConnection: (Connection) -> Unit = {},
                     manager: (Database) -> TransactionManager = { ThreadLocalTransactionManager(it, DEFAULT_REPETITION_ATTEMPTS) }
         ): Database {
             Class.forName(driver).newInstance()
 
-            return doConnect(getDialectName(url), { DriverManager.getConnection(url, user, password) }, setupConnection, manager )
+            return doConnect(getDialectName(url), registration, { DriverManager.getConnection(url, user, password) }, setupConnection, manager)
         }
 
-        fun getDefaultIsolationLevel(db: Database) : Int =
-            when(db.vendor) {
-                SQLiteDialect.dialectName -> Connection.TRANSACTION_SERIALIZABLE
-                OracleDialect.dialectName -> Connection.TRANSACTION_READ_COMMITTED
-                else -> DEFAULT_ISOLATION_LEVEL
-            }
+        fun getDefaultIsolationLevel(db: Database): Int =
+                when (db.vendor) {
+                    SQLiteDialect.dialectName -> Connection.TRANSACTION_SERIALIZABLE
+                    OracleDialect.dialectName -> Connection.TRANSACTION_READ_COMMITTED
+                    else -> DEFAULT_ISOLATION_LEVEL
+                }
 
         private fun getDriver(url: String) = when {
             url.startsWith("jdbc:h2") -> "org.h2.Driver"
@@ -157,4 +168,4 @@ class Database private constructor(private val resolvedVendor: String? = null, v
 
 interface DatabaseConnectionAutoRegistration : (Connection) -> ExposedConnection<*>
 
-val Database.name : String get() = url.substringAfterLast('/').substringBefore('?')
+val Database.name: String get() = url.substringAfterLast('/').substringBefore('?')
